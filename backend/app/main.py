@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from app.models import NewsInput, MediaPlan, NewsAnalysis, RegenerateRequest, GeneratedPost, Platform, BrandProfile
 from app.agents.graph import app as agent_app
@@ -43,41 +43,109 @@ async def get_plan(plan_id: str, user: User = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="План не найден")
     return data
 
-@app.post("/generate", response_model=MediaPlan)
-async def generate_plan(news: NewsInput, user: User = Depends(get_current_user)):
-    """
-    Triggers the AI Agent workflow to generate a media plan.
-    """
+# Background task for generation
+async def run_generation_task(task_id: str, news: NewsInput, user_id: int):
+    """Background task that runs the actual generation."""
+    from app.task_queue import update_task_status, TaskStatus
+    from app.storage import storage
+    
     try:
-        # Run the LangGraph workflow with user context
-        initial_state = {"input": news, "user_id": user.id, "errors": []}
+        update_task_status(task_id, TaskStatus.PROCESSING)
+        
+        # Run the LangGraph workflow with user context and mode
+        initial_state = {
+            "input": news, 
+            "user_id": user_id, 
+            "mode": news.mode or "pr",
+            "target_brand": news.target_brand,
+            "errors": []
+        }
         result = await agent_app.ainvoke(initial_state)
         
         if result.get("errors"):
-            print(f"Workflow Errors: {result['errors']}")
-            raise HTTPException(status_code=500, detail=f"Agent Error: {result['errors']}")
+            update_task_status(task_id, TaskStatus.ERROR, error=str(result['errors']))
+            return
             
         # Construct response
-        # Use result['input'] to get the updated news object (with scraped text)
         final_input = result.get("input", news)
         
         plan = MediaPlan(
-            id=str(uuid.uuid4()),
+            id=task_id,  # Use task_id as plan_id
             original_news=final_input,
             analysis=result["analysis"],
             posts=result["posts"]
         )
         
         # Save to MinIO History (User specific)
-        from app.storage import storage
-        storage.save_generation(user.id, plan.id, plan.dict())
+        storage.save_generation(user_id, plan.id, plan.dict())
         
-        return plan
+        # Update task with result
+        update_task_status(task_id, TaskStatus.READY, data=plan.dict())
+        
+        # Publish Notification to Redis
+        try:
+            redis_client.publish("task_updates", json.dumps({
+                "type": "task_completed",
+                "task_id": task_id,
+                "user_id": user_id,
+                "summary": plan.analysis.summary,
+                "status": "ready"
+            }))
+        except Exception as e:
+            print(f"Redis Publish Error: {e}")
         
     except Exception as e:
+        print(f"Generation Error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        update_task_status(task_id, TaskStatus.ERROR, error=str(e))
+        
+        # Publish Error Notification
+        try:
+            redis_client.publish("task_updates", json.dumps({
+                "type": "task_error",
+                "task_id": task_id,
+                "user_id": user_id,
+                "error": str(e)
+            }))
+        except:
+            pass
+
+@app.post("/generate")
+async def generate_plan(news: NewsInput, background_tasks: BackgroundTasks, user: User = Depends(get_current_user)):
+    """
+    Starts async generation. Returns task ID immediately.
+    Poll /task/{id}/status for updates.
+    """
+    from app.task_queue import save_task, can_start_task, TaskStatus
+    
+    # Check if user can start new task
+    if not can_start_task(user.id):
+        raise HTTPException(status_code=429, detail="Максимум 3 активных генерации. Подождите завершения.")
+    
+    # Create task
+    task_id = str(uuid.uuid4())
+    save_task(task_id, user.id, TaskStatus.PENDING)
+    
+    # Queue background task
+    background_tasks.add_task(run_generation_task, task_id, news, user.id)
+    
+    return {"id": task_id, "status": "pending"}
+
+@app.get("/task/{task_id}/status")
+async def get_task_status(task_id: str, user: User = Depends(get_current_user)):
+    """Get status of a generation task."""
+    from app.task_queue import get_task
+    
+    task = get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    
+    # Verify ownership
+    if task.get("user_id") != user.id:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+    
+    return task
 
 @app.post("/regenerate", response_model=GeneratedPost)
 async def regenerate_post(request: RegenerateRequest, user: User = Depends(get_current_user)):
@@ -228,19 +296,31 @@ async def regenerate_post(request: RegenerateRequest, user: User = Depends(get_c
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/monitor/scan", response_model=list[NewsInput])
-async def scan_news(user: User = Depends(get_current_user)):
+async def scan_news(target_brand: str | None = None, user: User = Depends(get_current_user)):
     """
-    Scans for recent news about the brand using user's saved brand profile.
+    Scans for recent news about a brand.
+    - PR mode: uses user's saved brand profile
+    - Blogger mode: uses target_brand parameter
     """
     from app.agents.monitoring import search_brand_mentions
     from app.models import BrandProfile
     
-    if not user.brand_profile:
-        raise HTTPException(status_code=400, detail="Сначала настройте профиль бренда!")
+    if target_brand:
+        # Blogger mode: create temporary profile with just the name
+        profile = BrandProfile(
+            name=target_brand,
+            description="",
+            tone_of_voice="",
+            target_audience="",
+            keywords=[target_brand]
+        )
+    elif user.brand_profile:
+        # PR mode: use user's saved profile
+        profile = BrandProfile(**user.brand_profile)
+    else:
+        raise HTTPException(status_code=400, detail="Укажите бренд для поиска или настройте профиль!")
     
     try:
-        # Convert dict to BrandProfile model
-        profile = BrandProfile(**user.brand_profile)
         results = await search_brand_mentions(profile)
         return results
     except Exception as e:
@@ -249,15 +329,18 @@ async def scan_news(user: User = Depends(get_current_user)):
 @app.post("/feedback")
 async def feedback(plan_id: str, like: bool, user: User = Depends(get_current_user)):
     """
-    Handles user feedback. If like=True, promotes the case to RAG knowledge base.
+    Handles user feedback. Updates 'liked' status and promotes to RAG if liked.
     """
-    if not like:
-        return {"status": "ignored"}
-        
+    from app.storage import storage
+    from app.rag.store import rag_store
+
     try:
-        from app.storage import storage
-        from app.rag.store import rag_store
+        # 0. Update 'liked' status in persistence
+        storage.update_generation(user.id, plan_id, {"liked": like})
         
+        if not like:
+            return {"status": "unliked"}
+            
         # 1. Get Data first to know the category
         data = storage.get_generation(user.id, plan_id)
         if not data:

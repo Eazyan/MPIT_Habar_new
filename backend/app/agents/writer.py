@@ -37,10 +37,21 @@ def writer_node(state: AgentState) -> AgentState:
     try:
         llm = get_llm(model_provider)
         
-        # Extract brand name safely
+        # Extract brand name and mode safely
+        mode = state.get("mode", "pr")
+        target_brand = state.get("target_brand")
         brand_name = "Unknown Brand"
-        if state.get("input") and state["input"].brand_profile:
-            brand_name = state["input"].brand_profile.name
+        
+        if mode == "blogger":
+            brand_name = target_brand or "Unknown Brand"
+            role_description = f"You are a TECH/BUSINESS BLOGGER reviewing news about {brand_name}."
+            voice_instruction = f"Write as an independent blogger giving your opinion on {brand_name}."
+        else:
+            # PR mode
+            if state.get("input") and state["input"].brand_profile:
+                brand_name = state["input"].brand_profile.name
+            role_description = f"You are the Head of Communications for {brand_name}."
+            voice_instruction = f"Write AS {brand_name}. You are the official voice of the brand."
 
         for platform in platforms:
             # Define specific constraints per platform
@@ -78,10 +89,10 @@ def writer_node(state: AgentState) -> AgentState:
                 style_guide = "Engaging social media style. Emojis allowed. NO Markdown headers. Ready to publish."
 
             prompt = f"""
-            YOU ARE THE OFFICIAL VOICE OF THE BRAND: {brand_name}.
+            {voice_instruction}
             
             CRITICAL RULES:
-            1. **Perspective**: Write AS {brand_name}.
+            1. **Perspective**: {voice_instruction}
             2. **Language**: The post MUST be in RUSSIAN (except for the Image Prompt).
             3. **Structure**: Follow the Style Guide for {platform.value} strictly.
             4. **Grounding**: Base content on facts.
@@ -106,7 +117,7 @@ def writer_node(state: AgentState) -> AgentState:
             """
             
             messages = [
-                SystemMessage(content=f"You are the Head of Communications for the brand. You speak with authority, precision, and brand alignment."),
+                SystemMessage(content=role_description),
                 HumanMessage(content=prompt)
             ]
             

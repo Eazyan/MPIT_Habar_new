@@ -14,6 +14,18 @@ class StorageClient:
         )
         self.history_bucket = "history"
         self.rag_bucket = "rag-knowledge"
+        
+        # Ensure buckets exist
+        self._ensure_bucket(self.history_bucket)
+        self._ensure_bucket(self.rag_bucket)
+
+    def _ensure_bucket(self, bucket_name):
+        try:
+            if not self.client.bucket_exists(bucket_name):
+                self.client.make_bucket(bucket_name)
+                print(f"Created bucket: {bucket_name}")
+        except Exception as e:
+            print(f"MinIO Init Error ({bucket_name}): {e}")
 
     def save_generation(self, user_id: int, plan_id: str, data: dict):
         """Saves the full generation data to the history bucket."""
@@ -58,6 +70,22 @@ class StorageClient:
         except Exception as e:
             print(f"MinIO Read Error: {e}")
             return None
+
+    def update_generation(self, user_id: int, plan_id: str, updates: dict) -> bool:
+        """Updates specific fields of a generation."""
+        try:
+            current_data = self.get_generation(user_id, plan_id)
+            if not current_data:
+                return False
+            
+            # Update fields
+            current_data.update(updates)
+            
+            # Save back
+            return self.save_generation(user_id, plan_id, current_data)
+        except Exception as e:
+            print(f"MinIO Update Error: {e}")
+            return False
 
     def list_generations(self, user_id: int, limit: int = 10) -> list:
         """Lists recent generations from history bucket."""

@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { GlassCard } from "@/components/ui/glass-card";
-import { Sparkles, Send, Link as LinkIcon, Settings, Radar, History, ArrowRight } from "lucide-react";
+import { Sparkles, Send, Link as LinkIcon, Settings, Radar, History, ArrowRight, RefreshCw, AlertTriangle, Heart } from "lucide-react";
 import { motion } from "framer-motion";
 import { useRouter } from "next/navigation";
 import { BrandSettings } from "@/components/brand-settings";
@@ -17,6 +17,8 @@ export default function Home() {
   const [recentPlans, setRecentPlans] = useState<any[]>([]);
 
   const [modelProvider, setModelProvider] = useState("claude");
+  const [workMode, setWorkMode] = useState<"blogger" | "pr">("pr");
+  const [targetBrand, setTargetBrand] = useState("");
 
   const router = useRouter();
   const { isAuthenticated, isLoading, user, logout } = useAuth();
@@ -59,26 +61,40 @@ export default function Home() {
 
     fetchBrandProfile();
     fetchHistory();
+
+    const handleFocus = () => {
+      fetchHistory();
+    };
+
+    window.addEventListener("focus", handleFocus);
+    return () => window.removeEventListener("focus", handleFocus);
   }, [showSettings, isAuthenticated]);
 
   const [scanResults, setScanResults] = useState<any[]>([]);
   const [showScanResults, setShowScanResults] = useState(false);
 
-  const handleGenerate = async (mode: "link" | "monitoring") => {
+  const handleGenerate = async (actionMode: "link" | "monitoring") => {
     setLoading(true);
     const { api } = await import("@/lib/api");
 
-    if (mode === "monitoring") {
-      if (!brandName) {
+    if (actionMode === "monitoring") {
+      // For blogger mode, need target brand; for PR mode, need profile
+      if (workMode === "blogger" && !targetBrand) {
+        alert("Введите название бренда для поиска!");
+        setLoading(false);
+        return;
+      }
+      if (workMode === "pr" && !brandName) {
         alert("Сначала настройте профиль бренда!");
         setShowSettings(true);
         setLoading(false);
         return;
       }
 
-      // Run Scan (backend uses user.brand_profile)
+      // Run Scan
       try {
-        const res = await api.post("/monitor/scan");
+        const scanParams = workMode === "blogger" ? { target_brand: targetBrand } : {};
+        const res = await api.post("/monitor/scan", null, { params: scanParams });
         setScanResults(res.data);
         setShowScanResults(true);
       } catch (error: any) {
@@ -91,24 +107,69 @@ export default function Home() {
       return;
     }
 
-    // Link Mode Logic
+    // Link Mode Logic - Async
     try {
       const payload = {
         url,
-        model_provider: modelProvider
+        model_provider: modelProvider,
+        mode: workMode,
+        target_brand: workMode === "blogger" ? targetBrand : undefined
       };
 
       const res = await api.post("/generate", payload);
-      const data = res.data;
+      const taskId = res.data.id;
 
-      router.push(`/plan/${data.id}`);
+      // Add pending task to history immediately
+      const pendingPlan = {
+        id: taskId,
+        status: "pending",
+        url: url,
+        created_at: new Date().toISOString()
+      };
+      setRecentPlans(prev => [pendingPlan, ...prev]);
 
-    } catch (error) {
+      // Start polling for status
+      pollTaskStatus(taskId);
+
+      // Clear input
+      setUrl("");
+
+    } catch (error: any) {
       console.error(error);
-      alert("Ошибка генерации. Проверьте консоль.");
+      const msg = error.response?.data?.detail || "Ошибка генерации";
+      alert(msg);
     } finally {
       setLoading(false);
     }
+  };
+
+  // Polling function for task status
+  const pollTaskStatus = async (taskId: string) => {
+    const { api } = await import("@/lib/api");
+    const poll = async () => {
+      try {
+        const res = await api.get(`/task/${taskId}/status`);
+        const task = res.data;
+
+        if (task.status === "ready") {
+          // Update history with completed plan
+          setRecentPlans(prev => prev.map(p =>
+            p.id === taskId ? { ...p, ...task.data, status: "ready" } : p
+          ));
+        } else if (task.status === "error") {
+          // Update with error
+          setRecentPlans(prev => prev.map(p =>
+            p.id === taskId ? { ...p, status: "error", error: task.error } : p
+          ));
+        } else {
+          // Still processing, poll again
+          setTimeout(poll, 3000);
+        }
+      } catch (e) {
+        console.error("Polling error:", e);
+      }
+    };
+    poll();
   };
 
   const handleSelectNews = async (newsItem: any) => {
@@ -119,18 +180,31 @@ export default function Home() {
     try {
       const payload = {
         url: newsItem.url,
-        text: newsItem.text, // Pass the text we found
-        model_provider: modelProvider
+        text: newsItem.text,
+        model_provider: modelProvider,
+        mode: workMode,
+        target_brand: workMode === "blogger" ? targetBrand : undefined
       };
 
       const res = await api.post("/generate", payload);
-      const data = res.data;
+      const taskId = res.data.id;
 
-      router.push(`/plan/${data.id}`);
+      // Add pending task to history immediately
+      const pendingPlan = {
+        id: taskId,
+        status: "pending",
+        url: newsItem.url,
+        created_at: new Date().toISOString()
+      };
+      setRecentPlans(prev => [pendingPlan, ...prev]);
 
-    } catch (error) {
+      // Start polling for status
+      pollTaskStatus(taskId);
+
+    } catch (error: any) {
       console.error(error);
-      alert("Ошибка генерации");
+      const msg = error.response?.data?.detail || "Ошибка генерации";
+      alert(msg);
     } finally {
       setLoading(false);
     }
@@ -151,7 +225,7 @@ export default function Home() {
       <div className="max-w-5xl mx-auto w-full z-10 space-y-8">
 
         {/* Header */}
-        <header className="flex justify-between items-center">
+        <header className="flex justify-between items-center flex-wrap gap-3">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600">
               <Sparkles className="w-6 h-6 text-white" />
@@ -162,20 +236,11 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            {/* Brand Settings Button */}
-            <button
-              onClick={() => setShowSettings(true)}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-white transition-colors border border-white/10"
-            >
-              <Settings className="w-4 h-4" />
-              <span>{brandName || "Настроить Бренд"}</span>
-            </button>
-
-            {/* User Menu */}
-            <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/5 border border-white/10">
+          <div className="flex items-center gap-2 md:gap-3">
+            {/* User Menu - compact on mobile */}
+            <div className="flex items-center gap-2 px-2 md:px-3 py-2 rounded-lg bg-white/5 border border-white/10">
               <User className="w-4 h-4 text-gray-400" />
-              <span className="text-sm text-white max-w-[120px] truncate">
+              <span className="text-sm text-white max-w-[80px] md:max-w-[120px] truncate hidden sm:inline">
                 {user?.full_name || user?.email || "Пользователь"}
               </span>
             </div>
@@ -190,6 +255,52 @@ export default function Home() {
             </button>
           </div>
         </header>
+
+        {/* Mode Toggle Bar */}
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 p-3 rounded-xl bg-white/5 border border-white/10">
+          {/* Mode Tabs */}
+          <div className="flex rounded-lg bg-black/30 p-1 w-full sm:w-auto">
+            <button
+              onClick={() => setWorkMode("blogger")}
+              className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 ${workMode === "blogger"
+                ? "bg-gradient-to-r from-blue-600 to-blue-500 text-white shadow-lg shadow-blue-500/25"
+                : "text-gray-400 hover:text-white hover:bg-white/5"
+                }`}
+            >
+              📝 Блогер
+            </button>
+            <button
+              onClick={() => setWorkMode("pr")}
+              className={`flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 ${workMode === "pr"
+                ? "bg-gradient-to-r from-purple-600 to-purple-500 text-white shadow-lg shadow-purple-500/25"
+                : "text-gray-400 hover:text-white hover:bg-white/5"
+                }`}
+            >
+              🏢 PR-специалист
+            </button>
+          </div>
+
+          {/* Context Input - always same width to prevent jumping */}
+          <div className="flex-1 max-w-md">
+            {workMode === "blogger" ? (
+              <input
+                type="text"
+                placeholder="🔍 О каком бренде пишем? (Apple, Tesla...)"
+                value={targetBrand}
+                onChange={(e) => setTargetBrand(e.target.value)}
+                className="w-full bg-black/30 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition-all"
+              />
+            ) : (
+              <button
+                onClick={() => setShowSettings(true)}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-black/30 hover:bg-white/5 text-white transition-colors border border-white/10"
+              >
+                <Settings className="w-4 h-4" />
+                <span className="truncate">{brandName || "Настроить профиль компании"}</span>
+              </button>
+            )}
+          </div>
+        </div>
 
         {/* Dashboard Grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -270,18 +381,97 @@ export default function Home() {
           </h3>
 
           <div className="grid gap-4">
-            {recentPlans.length > 0 ? recentPlans.map((plan, i) => (
-              <GlassCard key={i} className="p-4 flex items-center justify-between hover:bg-white/5 transition-colors cursor-pointer" onClick={() => router.push(`/plan/${plan.id}`)}>
-                <div>
-                  <h4 className="text-white font-medium mb-1 line-clamp-1">{plan.analysis.summary}</h4>
-                  <div className="flex gap-2 text-xs text-gray-500">
-                    <span>{new Date(plan.created_at).toLocaleDateString()}</span>
-                    <span className="px-2 py-0.5 rounded bg-white/10 text-gray-300">{plan.posts.length} постов</span>
+            {recentPlans.length > 0 ? recentPlans.map((plan, i) => {
+              const isPending = plan.status === 'pending' || plan.status === 'processing';
+              const isError = plan.status === 'error';
+
+              if (isPending) {
+                return (
+                  <GlassCard key={i} className="p-4 flex items-center justify-between bg-white/5 opacity-70 border border-blue-500/30">
+                    <div>
+                      <h4 className="text-white font-medium mb-1 line-clamp-1 animate-pulse">
+                        Генерация... {plan.url ? `(${new URL(plan.url).hostname})` : ""}
+                      </h4>
+                      <div className="flex gap-2 text-xs text-gray-500">
+                        <span>{new Date(plan.created_at).toLocaleDateString()}</span>
+                        <span className="px-2 py-0.5 rounded bg-blue-500/20 text-blue-300">В процессе</span>
+                      </div>
+                    </div>
+                    <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 2, ease: "linear" }}>
+                      <RefreshCw className="w-5 h-5 text-blue-400" />
+                    </motion.div>
+                  </GlassCard>
+                );
+              }
+
+              if (isError) {
+                return (
+                  <GlassCard key={i} className="p-4 flex items-center justify-between border-red-500/30 bg-red-500/5">
+                    <div>
+                      <h4 className="text-red-400 font-medium mb-1 line-clamp-1">Ошибка генерации</h4>
+                      <p className="text-xs text-gray-500 line-clamp-1">{plan.error || "Неизвестная ошибка"}</p>
+                    </div>
+                    <AlertTriangle className="w-5 h-5 text-red-500" />
+                  </GlassCard>
+                );
+              }
+
+              const sentimentRaw = plan.analysis?.sentiment?.toLowerCase() || "";
+              const isPositive = sentimentRaw.includes("positive") || sentimentRaw.includes("позитив");
+              const isNegative = sentimentRaw.includes("negative") || sentimentRaw.includes("негатив");
+
+              const sentimentColor = isPositive ? "text-green-400 border-green-500/30 bg-green-500/10" :
+                isNegative ? "text-red-400 border-red-500/30 bg-red-500/10" : "text-blue-400 border-blue-500/30 bg-blue-500/10";
+
+              const sentimentLabel = isPositive ? "позитив" : isNegative ? "негатив" : "нейтрально";
+
+              return (
+                <GlassCard key={i} className="p-4 flex items-start justify-between hover:bg-white/5 transition-all duration-200 cursor-pointer group border border-white/5 hover:border-white/10" onClick={() => router.push(`/plan/${plan.id}`)}>
+                  <div className="flex-1 min-w-0 mr-4 space-y-2">
+                    <h4 className="text-base font-medium text-gray-100 leading-snug line-clamp-2 group-hover:text-white transition-colors">
+                      {plan.analysis?.summary || "Анализ новости"}
+                    </h4>
+
+                    <div className="flex flex-wrap items-center gap-3 text-xs text-gray-400">
+                      {/* Date */}
+                      <span>
+                        {new Date(plan.created_at).toLocaleDateString()}
+                      </span>
+
+                      {/* Tags */}
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {plan.analysis?.topics?.slice(0, 3).map((tag: string, idx: number) => (
+                          <span key={idx} className="px-2 py-0.5 rounded bg-white/5 text-gray-400">
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+
+                      {/* Sentiment Indicator */}
+                      {plan.analysis?.sentiment && (
+                        <div className={`flex items-center justify-center px-2 py-0.5 rounded-full border ${sentimentColor} bg-opacity-10 border-opacity-20`}>
+                          <span className="font-medium text-[10px] uppercase tracking-wide opacity-90">{sentimentLabel}</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-                <ArrowRight className="w-5 h-5 text-gray-600" />
-              </GlassCard>
-            )) : (
+
+                  <div className="flex flex-col items-end gap-3 self-center pl-2">
+                    {/* Like Indicator */}
+                    {plan.liked && (
+                      <div className="p-1.5 rounded-full bg-red-500/10 border border-red-500/20">
+                        <Heart className="w-4 h-4 text-red-500 fill-red-500" />
+                      </div>
+                    )}
+
+                    {/* Arrow */}
+                    <div className={`p-2 rounded-full border border-white/5 bg-white/5 transition-all text-gray-500 group-hover:bg-white/10 group-hover:text-white ${!plan.liked ? 'mt-auto' : ''}`}>
+                      <ArrowRight className="w-4 h-4" />
+                    </div>
+                  </div>
+                </GlassCard>
+              );
+            }) : (
               <div className="text-center py-8 text-gray-500">
                 История пуста. Запустите первую генерацию!
               </div>

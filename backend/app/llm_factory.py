@@ -10,13 +10,21 @@ def get_llm(model_provider: str = "claude"):
     
     if model_provider == "claude":
         api_key = os.getenv("ANTHROPIC_API_KEY")
+        base_url = os.getenv("ANTHROPIC_BASE_URL") # Optional proxy
+        
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY is not set")
-        return ChatAnthropic(
-            model="claude-sonnet-4-20250514",
-            api_key=api_key,
-            temperature=0.7
-        )
+            
+        kwargs = {
+            "model": "claude-3-5-sonnet-20241022", # Updated to latest stable or use env
+            "api_key": api_key,
+            "temperature": 0.7
+        }
+        
+        if base_url:
+            kwargs["anthropic_api_url"] = base_url
+            
+        return ChatAnthropic(**kwargs)
         
     elif model_provider == "qwen":
         api_key = os.getenv("OPENROUTER_API_KEY")

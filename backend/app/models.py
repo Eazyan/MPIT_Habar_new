@@ -45,6 +45,8 @@ class NewsInput(BaseModel):
     text: Optional[str] = None
     model_provider: str = Field("claude", description="Модель: claude, qwen, deepseek")
     brand_profile: Optional[BrandProfile] = None # Context for analysis
+    mode: str = Field("pr", description="Режим: blogger или pr")
+    target_brand: Optional[str] = Field(None, description="Для блогера: бренд для анализа")
 
 class MediaPlan(BaseModel):
     id: str
@@ -52,6 +54,7 @@ class MediaPlan(BaseModel):
     original_news: NewsInput
     analysis: NewsAnalysis
     posts: List[GeneratedPost]
+    liked: bool = False
 
 class RegenerateRequest(BaseModel):
     plan_id: str
